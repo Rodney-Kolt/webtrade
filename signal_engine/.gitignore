@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.session
+*.session-journal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
