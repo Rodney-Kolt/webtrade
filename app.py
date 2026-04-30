@@ -260,15 +260,21 @@ def format_alert(signal: dict, source_chat: str, received_at: datetime) -> str:
 # Use a persistent session file so you only need to authenticate once.
 SESSION_NAME = "signal_assistant"
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# Client is created inside the background thread where the event loop lives.
+# This module-level variable is set before the handler is registered.
+client: TelegramClient | None = None
 
 
-async def _resolve_channels() -> list:
+# Populated after client connects
+_resolved_entities: list = []
+
+
+async def _resolve_channels(tg: TelegramClient) -> list:
     """Resolve channel identifiers to Telethon entity objects."""
     entities = []
     for ch in CHANNELS:
         try:
-            entity = await client.get_entity(ch)
+            entity = await tg.get_entity(ch)
             entities.append(entity)
             log.info("Monitoring channel: %s (id=%s)", getattr(entity, "title", ch), entity.id)
         except Exception as exc:
@@ -276,76 +282,87 @@ async def _resolve_channels() -> list:
     return entities
 
 
-@client.on(events.NewMessage())
-async def _on_new_message(event: events.NewMessage.Event) -> None:
-    """Handle every incoming message and decide whether to forward it."""
-    msg: Message = event.message
-    text = msg.raw_text or ""
-    if not text:
-        return
-
-    # Only process messages from monitored channels
-    try:
-        chat = await event.get_chat()
-        chat_id = chat.id
-    except Exception:
-        return
-
-    monitored_ids = {getattr(e, "id", None) for e in _resolved_entities}
-    if chat_id not in monitored_ids:
-        return
-
-    source_name = getattr(chat, "title", str(chat_id))
-    received_at = datetime.now(timezone.utc)
-
-    log.info("[%s] New message from '%s': %.120s", received_at.strftime("%H:%M:%S"), source_name, text)
-
-    signal = parse_signal(text)
-    if signal is None:
-        log.info("  → No signal pattern detected. Skipping.")
-        return
-
-    log.info(
-        "  → Signal detected: %s %s %s (payout=%s)",
-        signal["asset"],
-        signal["direction"],
-        signal["timeframe"],
-        signal["payout"],
-    )
-
-    passed, reason = check_filters(signal)
-    if not passed:
-        log.info("  → FILTERED OUT: %s", reason)
-        return
-
-    log.info("  → PASSED all filters. Forwarding alert.")
-    alert_text = format_alert(signal, source_name, received_at)
-
-    try:
-        await client.send_message(MY_CHAT_ID, alert_text)
-        log.info("  → Alert sent to chat '%s'.", MY_CHAT_ID)
-    except Exception as exc:
-        log.error("  → Failed to send alert: %s", exc)
-
-
-# Populated after client connects
-_resolved_entities: list = []
-
-
 async def _run_client() -> None:
-    """Start the Telethon client, authenticate, and run until disconnected."""
-    global _resolved_entities
-    await client.start(phone=PHONE)
+    """
+    Create the TelegramClient, register the event handler, authenticate,
+    and run until disconnected.  Everything happens inside this coroutine
+    so the client is always created in the thread that owns the event loop.
+    """
+    global client, _resolved_entities
+
+    # Create the client here, inside the running loop
+    tg = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    client = tg
+
+    @tg.on(events.NewMessage())
+    async def _on_new_message(event: events.NewMessage.Event) -> None:
+        """Handle every incoming message and decide whether to forward it."""
+        msg: Message = event.message
+        text = msg.raw_text or ""
+        if not text:
+            return
+
+        # Only process messages from monitored channels
+        try:
+            chat = await event.get_chat()
+            chat_id = chat.id
+        except Exception:
+            return
+
+        monitored_ids = {getattr(e, "id", None) for e in _resolved_entities}
+        if chat_id not in monitored_ids:
+            return
+
+        source_name = getattr(chat, "title", str(chat_id))
+        received_at = datetime.now(timezone.utc)
+
+        log.info(
+            "[%s] New message from '%s': %.120s",
+            received_at.strftime("%H:%M:%S"),
+            source_name,
+            text,
+        )
+
+        signal = parse_signal(text)
+        if signal is None:
+            log.info("  -> No signal pattern detected. Skipping.")
+            return
+
+        log.info(
+            "  -> Signal detected: %s %s %s (payout=%s)",
+            signal["asset"],
+            signal["direction"],
+            signal["timeframe"],
+            signal["payout"],
+        )
+
+        passed, reason = check_filters(signal)
+        if not passed:
+            log.info("  -> FILTERED OUT: %s", reason)
+            return
+
+        log.info("  -> PASSED all filters. Forwarding alert.")
+        alert_text = format_alert(signal, source_name, received_at)
+
+        try:
+            await tg.send_message(MY_CHAT_ID, alert_text)
+            log.info("  -> Alert sent to chat '%s'.", MY_CHAT_ID)
+        except Exception as exc:
+            log.error("  -> Failed to send alert: %s", exc)
+
+    await tg.start(phone=PHONE)
     log.info("Telethon client authenticated successfully.")
-    _resolved_entities = await _resolve_channels()
+    _resolved_entities = await _resolve_channels(tg)
     if not _resolved_entities:
         log.warning("No channels resolved. The bot will not receive any signals.")
-    log.info("Listening for signals…")
-    await client.run_until_disconnected()
+    log.info("Listening for signals...")
+    await tg.run_until_disconnected()
 
 
 def _start_telegram_thread() -> None:
     """Run the asyncio event loop for Telethon in a dedicated daemon thread."""
+    # Create a brand-new event loop for this thread.
+    # Python 3.10+ no longer creates a default loop automatically.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
