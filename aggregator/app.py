@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
+import ecocal
 import requests
 import websocket
 from dotenv import load_dotenv
@@ -72,10 +73,10 @@ def _req(k: str) -> str:
 def _opt(k: str, default: str = "") -> str:
     return os.environ.get(k, default).strip()
 
-FINNWORLDS_KEY   = _req("FINNWORLDS_KEY")
 NEWSAPI_KEY      = _req("NEWSAPI_KEY")
 BOT_TOKEN        = _req("TELEGRAM_BOT_TOKEN")
-POCKET_SSID      = _opt("POCKET_SSID", "")          # optional – for WS auth
+# Pocket Option ci_session cookie (URL-encoded value from browser DevTools)
+POCKET_CI_SESSION = _opt("POCKET_CI_SESSION", "")
 SCAN_INTERVAL    = int(_opt("SCAN_INTERVAL_SECONDS", "900"))   # 15 min
 SIGNAL_COOLDOWN  = int(_opt("SIGNAL_COOLDOWN_SECONDS", "60"))  # 1 min dedup
 
@@ -172,75 +173,95 @@ def _on_cooldown(asset: str, direction: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------------
-# Module 1 – Fundamentals (Finnworlds)
+# Module 1 – Fundamentals (ecocal – Forex Factory economic calendar)
 # ---------------------------------------------------------------------------
-FINNWORLDS_URL = "https://api.finnworlds.com/api/v1/macrocalendar"
+# ecocal scrapes the Forex Factory calendar and returns structured events
+# with 'actual', 'consensus', and 'previous' values – no API key needed.
+
+ECOCAL_IMPACT_HIGH = 3   # ecocal uses integer 1/2/3 for low/medium/high
 
 def fetch_fundamentals() -> dict[str, str]:
     """
-    Fetch high-impact macro events and return currency bias map.
-    {"USD": "BULLISH", "EUR": "BEARISH", ...}
+    Fetch today's high-impact macro events via ecocal and return a
+    currency bias map: {"USD": "BULLISH", "EUR": "BEARISH", ...}
     """
-    log.info("[Fundamentals] Fetching macro calendar...")
+    log.info("[Fundamentals] Fetching economic calendar via ecocal...")
     try:
-        r = requests.get(
-            FINNWORLDS_URL,
-            params={"key": FINNWORLDS_KEY, "country": "us,gb,eu,jp,au,ca,nz,ch"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        events = (
-            data.get("result", {}).get("calendar", [])
-            or data.get("calendar", [])
-            or data.get("data", [])
-            or (data if isinstance(data, list) else [])
-        )
-        log.info("[Fundamentals] Events received: %d", len(events))
+        today = datetime.now(timezone.utc).date()
+        cal = ecocal.Calendar(date=str(today))
+        events = cal.events          # list of ecocal.Event objects
+        log.info("[Fundamentals] Total events today: %d", len(events))
 
         bias: dict[str, str] = {}
+
         for ev in events:
-            if str(ev.get("impact", "")).strip() != "3":
-                continue
-            country  = str(ev.get("country", "")).lower().strip()
-            currency = COUNTRY_TO_CCY.get(country)
-            if not currency:
-                continue
-            name = str(ev.get("event", "") or ev.get("name", "")).lower()
-            if not any(kw in name for kw in MACRO_KEYWORDS):
-                continue
-
-            def _parse(raw):
-                return float(
-                    str(raw).replace("%", "").replace("K", "000")
-                    .replace("M", "000000").strip()
-                )
-
-            try:
-                actual    = _parse(ev.get("actual", ""))
-                consensus = _parse(ev.get("consensus", "") or ev.get("forecast", ""))
-            except (ValueError, TypeError):
+            # Filter: high impact only
+            impact = getattr(ev, "impact", None)
+            # ecocal may return impact as int or string "High"/"Medium"/"Low"
+            if isinstance(impact, int):
+                if impact < ECOCAL_IMPACT_HIGH:
+                    continue
+            elif isinstance(impact, str):
+                if impact.lower() not in ("high", "3"):
+                    continue
+            else:
                 continue
 
-            new_bias = "BULLISH" if actual > consensus else ("BEARISH" if actual < consensus else None)
+            currency = str(getattr(ev, "currency", "") or "").upper().strip()
+            if not currency or currency not in COUNTRY_TO_CCY.values():
+                continue
+
+            event_name = str(getattr(ev, "name", "") or "").lower()
+            if not any(kw in event_name for kw in MACRO_KEYWORDS):
+                log.debug("[Fundamentals] Skipping '%s' – not in keyword list.", event_name[:60])
+                continue
+
+            # Parse actual and consensus values
+            def _parse_val(raw) -> Optional[float]:
+                if raw is None:
+                    return None
+                s = str(raw).replace("%", "").replace("K", "000") \
+                            .replace("M", "000000").replace(",", "").strip()
+                if not s or s in ("-", "N/A", ""):
+                    return None
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
+            actual    = _parse_val(getattr(ev, "actual",    None))
+            consensus = _parse_val(getattr(ev, "consensus", None)
+                                   or getattr(ev, "forecast", None))
+
+            if actual is None or consensus is None:
+                log.debug("[Fundamentals] Skipping '%s' – missing actual/consensus.", event_name[:60])
+                continue
+
+            new_bias = (
+                "BULLISH" if actual > consensus else
+                "BEARISH" if actual < consensus else
+                None
+            )
             if new_bias is None:
                 continue
 
             existing = bias.get(currency)
             if existing and existing != new_bias:
                 bias[currency] = "NEUTRAL"
-                log.info("[Fundamentals] %s conflicting → NEUTRAL", currency)
+                log.info("[Fundamentals] %s conflicting signals → NEUTRAL", currency)
             else:
                 bias[currency] = new_bias
-                log.info("[Fundamentals] %s → %s (event: %s)", currency, new_bias, name[:60])
+                log.info(
+                    "[Fundamentals] %s → %s | event='%s' actual=%s consensus=%s",
+                    currency, new_bias, event_name[:60], actual, consensus,
+                )
 
         with _state_lock:
             _macro_bias.clear()
             _macro_bias.update(bias)
             _last_fetch["fundamentals"] = _now_utc()
 
-        log.info("[Fundamentals] Bias: %s", bias or "none")
+        log.info("[Fundamentals] Bias summary: %s", bias or "none")
         return bias
 
     except Exception as exc:
@@ -410,9 +431,9 @@ def _on_ws_message(ws_obj, message: str) -> None:
     try:
         # Socket.IO handshake frames
         if message.startswith("0") or message.startswith("40"):
-            # Send auth if SSID provided
-            if POCKET_SSID:
-                ws_obj.send(f'42["auth",{{"session":"{POCKET_SSID}"}}]')
+            # Authenticate with ci_session cookie if provided
+            if POCKET_CI_SESSION:
+                ws_obj.send(f'42["auth",{{"ci_session":"{POCKET_CI_SESSION}"}}]')
             # Subscribe to all OTC pairs
             for pair in OTC_PAIRS:
                 ws_obj.send(f'42["subscribe",{{"asset":"{pair["ws_id"]}"}}]')
@@ -470,8 +491,8 @@ def _on_ws_close(ws_obj, code, msg) -> None:
 
 def _on_ws_open(ws_obj) -> None:
     log.info("[Technical] WebSocket connected.")
-    if POCKET_SSID:
-        ws_obj.send(f'42["auth",{{"session":"{POCKET_SSID}"}}]')
+    if POCKET_CI_SESSION:
+        ws_obj.send(f'42["auth",{{"ci_session":"{POCKET_CI_SESSION}"}}]')
     for pair in OTC_PAIRS:
         ws_obj.send(f'42["subscribe",{{"asset":"{pair["ws_id"]}"}}]')
 
